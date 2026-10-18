@@ -1,0 +1,163 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+        // Valeurs injectées par setup-pipeline.sh (modifiables ici)
+        DOCKERHUB_USER = 'oussematlili'
+        IMAGE_BASE     = 'oussematlili-5arcti7-appgestion'   // format : nomprenom_classe_nomProjet
+        BACKEND_IMAGE  = "${DOCKERHUB_USER}/${IMAGE_BASE}-backend"
+        TAG            = "${BUILD_NUMBER}"
+        K8S_NS         = 'devops'
+    }
+
+    stages {
+
+        stage('Prerequis (MySQL + SonarQube)') {
+            steps {
+                sh '''
+                    if docker ps -a --format '{{.Names}}' | grep -qx mysql-test; then
+                        docker start mysql-test
+                    else
+                        docker run -d --name mysql-test -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:8.0
+                    fi
+                    docker start sonarqube || { echo "Conteneur sonarqube absent : relancez la commande docker run du TP 6"; exit 1; }
+
+                    echo "Attente de MySQL..."
+                    for i in $(seq 1 40); do
+                        docker exec mysql-test mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && break
+                        sleep 3
+                    done
+                    docker exec mysql-test mysqladmin ping -uroot -proot --silent
+
+                    echo "Attente de SonarQube..."
+                    for i in $(seq 1 60); do
+                        curl -s http://localhost:9000/api/system/status | grep -q '"status":"UP"' && break
+                        sleep 5
+                    done
+                    curl -s http://localhost:9000/api/system/status | grep -q '"status":"UP"'
+                '''
+            }
+        }
+
+        stage('GIT') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                dir('backend') {
+                    sh 'mvn -B clean compile'
+                }
+            }
+        }
+
+        stage('Tests Backend') {
+            steps {
+                dir('backend') {
+                    sh 'mvn -B test'
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'backend/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('SonarQube') {
+            steps {
+                dir('backend') {
+                    withSonarQubeEnv('SonarQube') {
+                        sh 'mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar'
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Package Backend') {
+            steps {
+                dir('backend') {
+                    sh 'mvn -B package -DskipTests'
+                }
+            }
+        }
+
+        stage('Docker Build Backend') {
+            steps {
+                sh '''
+                    docker build -t $BACKEND_IMAGE:$TAG -t $BACKEND_IMAGE:latest backend
+                    docker images | grep -E "$IMAGE_BASE" || true
+                '''
+            }
+        }
+
+        stage('Docker Push Backend') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                                  usernameVariable: 'DH_USER',
+                                                  passwordVariable: 'DH_PASS')]) {
+                    sh '''
+                        echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+                        docker push $BACKEND_IMAGE:$TAG
+                        docker push $BACKEND_IMAGE:latest
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout || true'
+                }
+            }
+        }
+
+        stage('Deploy Backend (K8s)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-minikube', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        kubectl get nodes
+                        kubectl create namespace $K8S_NS --dry-run=client -o yaml | kubectl apply -f -
+
+                        kubectl apply -f k8s/mysql-deployment.yaml
+                        kubectl rollout status deployment/mysql -n $K8S_NS --timeout=240s
+
+                        sed "s|__BACKEND_IMAGE__|$BACKEND_IMAGE:$TAG|g" k8s/spring-deployment.yaml | kubectl apply -f -
+                        kubectl rollout status deployment/spring -n $K8S_NS --timeout=300s
+                    '''
+                }
+            }
+        }
+
+        stage('Verification') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-minikube', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        kubectl get pods -n $K8S_NS -o wide
+                        kubectl get svc  -n $K8S_NS
+                        kubectl logs deployment/spring -n $K8S_NS --tail=15
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo 'Pipeline termine avec succes : backend OK (build, qualite, image, deploiement Kubernetes).' }
+        failure { echo 'Pipeline en echec : consultez la console du stage en rouge.' }
+    }
+}

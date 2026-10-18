@@ -1,0 +1,11 @@
+src
+.mvn
+mvnw
+mvnw.cmd
+target/classes
+target/test-classes
+target/surefire-reports
+target/jacoco*
+target/sonar
+target/maven-status
+target/*.original

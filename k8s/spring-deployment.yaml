@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spring-config
+  namespace: devops
+data:
+  SPRING_DATASOURCE_URL: jdbc:mysql://mysql-service:3306/springdb
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spring-secret
+  namespace: devops
+type: Opaque
+data:
+  SPRING_DATASOURCE_USERNAME: c3ByaW5n        # spring
+  SPRING_DATASOURCE_PASSWORD: c3ByaW5nMTIz    # spring123
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring
+  namespace: devops
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spring
+  template:
+    metadata:
+      labels:
+        app: spring
+    spec:
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z mysql-service 3306; do echo waiting for mysql; sleep 3; done"]
+      containers:
+        - name: spring
+          image: __BACKEND_IMAGE__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: spring-config
+            - secretRef:
+                name: spring-secret
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: "-Xmx256m"
+          resources:
+            requests:
+              memory: "384Mi"
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spring-service
+  namespace: devops
+spec:
+  selector:
+    app: spring
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30081
+  type: NodePort

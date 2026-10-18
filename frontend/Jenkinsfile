@@ -1,0 +1,121 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+        // Valeurs injectees par setup-pipeline-v2.sh (modifiables ici)
+        DOCKERHUB_USER = 'oussematlili'
+        IMAGE_BASE     = 'oussematlili-5arcti7-appgestion'   // format : nomprenom_classe_nomProjet
+        FRONTEND_IMAGE = "${DOCKERHUB_USER}/${IMAGE_BASE}-frontend"
+        TAG            = "${BUILD_NUMBER}"
+        K8S_NS         = 'devops'
+    }
+
+    stages {
+
+        stage('Prerequis (SonarQube)') {
+            steps {
+                sh '''
+                    docker start sonarqube || { echo "Conteneur sonarqube absent : relancez la commande docker run du TP 6"; exit 1; }
+                    echo "Attente de SonarQube..."
+                    for i in $(seq 1 60); do
+                        curl -s http://localhost:9000/api/system/status | grep -q '"status":"UP"' && break
+                        sleep 5
+                    done
+                    curl -s http://localhost:9000/api/system/status | grep -q '"status":"UP"'
+                '''
+            }
+        }
+
+        stage('GIT') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build Angular') {
+            steps {
+                // Compile Angular dans le stage "build" du Dockerfile (npm ci + ng build --prod)
+                sh 'docker build --target build -t $FRONTEND_IMAGE:build-check frontend'
+            }
+        }
+
+        stage('SonarQube') {
+            steps {
+                dir('frontend') {
+                    withSonarQubeEnv('SonarQube') {
+                        // Scanner execute dans un conteneur : rien a installer dans Jenkins
+                        sh '''
+                            docker run --rm \
+                                -u "$(id -u):$(id -g)" \
+                                -e SONAR_USER_HOME=/tmp/.sonar \
+                                -e SONAR_HOST_URL=http://host.docker.internal:9000 \
+                                -e SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
+                                -v "$PWD:/usr/src" \
+                                sonarsource/sonar-scanner-cli \
+                                -Dsonar.projectKey=AppGestionDesProjets-Front \
+                                -Dsonar.projectName=frontend \
+                                -Dsonar.sources=src \
+                                "-Dsonar.exclusions=**/*.spec.ts" \
+                                -Dsonar.qualitygate.wait=true \
+                                -Dsonar.qualitygate.timeout=300
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build Frontend') {
+            steps {
+                sh '''
+                    docker build -t $FRONTEND_IMAGE:$TAG -t $FRONTEND_IMAGE:latest frontend
+                    docker images | grep -E "$IMAGE_BASE" || true
+                '''
+            }
+        }
+
+        stage('Docker Push Frontend') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                                  usernameVariable: 'DH_USER',
+                                                  passwordVariable: 'DH_PASS')]) {
+                    sh '''
+                        echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+                        docker push $FRONTEND_IMAGE:$TAG
+                        docker push $FRONTEND_IMAGE:latest
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout || true'
+                }
+            }
+        }
+
+        stage('Deploy Frontend (K8s)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-minikube', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        kubectl get nodes
+                        kubectl create namespace $K8S_NS --dry-run=client -o yaml | kubectl apply -f -
+                        sed "s|__FRONTEND_IMAGE__|$FRONTEND_IMAGE:$TAG|g" k8s/frontend-deployment.yaml | kubectl apply -f -
+                        kubectl rollout status deployment/frontend -n $K8S_NS --timeout=180s
+                        kubectl get pods -n $K8S_NS -o wide
+                        kubectl get svc  -n $K8S_NS
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo 'Pipeline frontend OK (build, qualite, image, deploiement Kubernetes).' }
+        failure { echo 'Pipeline en echec : consultez la console du stage en rouge.' }
+    }
+}
