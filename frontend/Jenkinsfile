@@ -60,7 +60,7 @@ pipeline {
                                 sonarsource/sonar-scanner-cli \
                                 -Dsonar.projectKey=AppGestionDesProjets-Front \
                                 -Dsonar.projectName=frontend \
-                                -Dsonar.sources=src \
+                                -Dsonar.sources=src -Dsonar.working.directory=/tmp/scannerwork-ci \
                                 "-Dsonar.exclusions=**/*.spec.ts" \
                                 -Dsonar.qualitygate.wait=true \
                                 -Dsonar.qualitygate.timeout=300
